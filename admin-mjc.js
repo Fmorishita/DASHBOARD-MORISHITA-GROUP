@@ -228,65 +228,85 @@ async function registerIncome(amount, description) {
 }
 
 // ─── Scheduled jobs ───
+// Lógica:
+// - Leer WhatsApp SOLO lunes y martes a las 10AM (UTC-6 = 16:00 UTC)
+//   para capturar gastos del fin de semana + lunes adicionales
+// - Reporte semanal SOLO lunes a las 9AM (antes de la lectura)
+//   así el martes puede complementar si faltaron gastos
+// - Sin reportes diarios
 function startScheduler(broadcast) {
-  // Check WhatsApp every 30 minutes
-  setInterval(async () => {
+
+  // Check every day at 10AM Mexico (16:00 UTC) — but only execute on Mon/Tue
+  scheduleDailyAt(16, 0, async () => {
+    const dayUTC = new Date().getUTCDay(); // 0=Sun,1=Mon,2=Tue
+    const isMon = dayUTC === 1;
+    const isTue = dayUTC === 2;
+
+    if (!isMon && !isTue) {
+      console.log('⏭ Hoy no es lunes/martes — omitiendo lectura de WhatsApp');
+      return;
+    }
+
+    console.log(`📱 ${isMon ? 'Lunes' : 'Martes'} — Leyendo gastos del fin de semana...`);
     try {
       const newExpenses = await processNewMessages();
       if (newExpenses.length > 0) {
         broadcast({ type: 'expenses_updated', count: newExpenses.length, expenses: newExpenses });
-        console.log(`💰 ${newExpenses.length} nuevos gastos procesados`);
+        console.log(`💰 ${newExpenses.length} gastos procesados`);
+      } else {
+        console.log('💰 Sin gastos nuevos en WhatsApp');
       }
-    } catch(e) { console.error('Scheduler error:', e.message); }
-  }, 30 * 60 * 1000);
-
-  // Daily report at 9 AM Mexico time (UTC-6 = 15:00 UTC)
-  scheduleDailyAt(15, 0, async () => {
-    console.log('📊 Generando reporte diario...');
-    try {
-      const report = await generateReport('daily');
-      await tgSend(report);
-      console.log('✅ Reporte diario enviado');
-    } catch(e) { console.error('Daily report error:', e.message); }
+    } catch(e) { console.error('WA sync error:', e.message); }
   });
 
-  // Weekly report every Monday
-  scheduleWeeklyMonday(15, 30, async () => {
-    console.log('📊 Generando reporte semanal...');
+  // Weekly report: Monday 9AM Mexico (15:00 UTC)
+  // Runs BEFORE the 10AM WhatsApp read — captures Wed-Sun gastos
+  // Tuesday's read will add any Monday/late additions (visible next week)
+  scheduleWeeklyMonday(15, 0, async () => {
+    console.log('📊 Generando reporte semanal (lunes 9AM)...');
     try {
+      // First do a quick sync to catch anything posted Mon morning
       await processNewMessages();
       const report = await generateReport('weekly');
       await tgSend(report);
-      console.log('✅ Reporte semanal enviado');
+      console.log('✅ Reporte semanal enviado a Fran');
     } catch(e) { console.error('Weekly report error:', e.message); }
   });
 
-  console.log('⏰ Scheduler iniciado: reporte diario 9AM, semanal lunes 9:30AM');
+  const nextMon = msUntilNextWeekday(1, 15, 0);
+  const nextTue = msUntilNextWeekday(2, 16, 0);
+  console.log(`⏰ Scheduler MJC iniciado:`);
+  console.log(`   📊 Próximo reporte semanal: lunes en ${Math.round(nextMon/3600000)}h`);
+  console.log(`   📱 Próxima lectura WA: ${nextTue < nextMon ? 'martes' : 'lunes'} en ${Math.round(Math.min(nextMon,nextTue)/3600000)}h`);
 }
 
-function scheduleDailyAt(hour, min, fn) {
+function scheduleDailyAt(hourUTC, minUTC, fn) {
   const now = new Date();
   const next = new Date();
-  next.setUTCHours(hour, min, 0, 0);
+  next.setUTCHours(hourUTC, minUTC, 0, 0);
   if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
   const delay = next - now;
   setTimeout(() => { fn(); setInterval(fn, 24 * 60 * 60 * 1000); }, delay);
-  console.log(`  ⏰ Próximo reporte diario en ${Math.round(delay/60000)} minutos`);
 }
 
-function scheduleWeeklyMonday(hour, min, fn) {
-  function nextMonday() {
-    const now = new Date();
-    const day = now.getUTCDay();
-    const daysUntilMonday = day === 1 ? 7 : (8 - day) % 7 || 7;
-    const next = new Date(now);
-    next.setUTCDate(now.getUTCDate() + daysUntilMonday);
-    next.setUTCHours(hour, min, 0, 0);
-    return next - now;
-  }
-  const delay = nextMonday();
+function scheduleWeeklyMonday(hourUTC, minUTC, fn) {
+  const delay = msUntilNextWeekday(1, hourUTC, minUTC);
   setTimeout(() => { fn(); setInterval(fn, 7 * 24 * 60 * 60 * 1000); }, delay);
-  console.log(`  ⏰ Próximo reporte semanal en ${Math.round(delay/3600000)} horas`);
+}
+
+function msUntilNextWeekday(weekday, hourUTC, minUTC) {
+  const now = new Date();
+  const day = now.getUTCDay();
+  let daysUntil = (weekday - day + 7) % 7;
+  if (daysUntil === 0) {
+    const todayTarget = new Date();
+    todayTarget.setUTCHours(hourUTC, minUTC, 0, 0);
+    if (todayTarget <= now) daysUntil = 7; // already passed today, next week
+  }
+  const next = new Date(now);
+  next.setUTCDate(now.getUTCDate() + daysUntil);
+  next.setUTCHours(hourUTC, minUTC, 0, 0);
+  return next - now;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
