@@ -2,6 +2,7 @@ const express = require('express');
 const { WebSocketServer } = require('ws');
 const cors = require('cors');
 const http = require('http');
+const adminMJC = require('./admin-mjc');
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -298,5 +299,47 @@ app.get('/api/tasks', (req, res) => res.json({ tasks }));
 // ─── Utils ───
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ─── Admin MJC endpoints ───
+app.post('/api/income', (req, res) => {
+  const { amount, description } = req.body;
+  if (!amount) return res.json({ ok: false, error: 'amount required' });
+  const income = adminMJC.registerIncome(parseFloat(amount), description || 'Ingreso manual');
+  broadcast({ type: 'income_registered', income });
+  res.json({ ok: true, income });
+});
+
+app.get('/api/report/daily', async (req, res) => {
+  try { const r = await adminMJC.generateReport('daily'); res.json({ ok: true, report: r }); }
+  catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+app.get('/api/report/weekly', async (req, res) => {
+  try { const r = await adminMJC.generateReport('weekly'); res.json({ ok: true, report: r }); }
+  catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+app.post('/api/sync-expenses', async (req, res) => {
+  try {
+    const expenses = await adminMJC.processNewMessages();
+    broadcast({ type: 'expenses_updated', count: expenses.length, expenses });
+    res.json({ ok: true, count: expenses.length, expenses });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
+app.get('/api/expenses', (req, res) => res.json({ ok: true, expenses: adminMJC.expensesDB }));
+app.get('/api/incomes', (req, res) => res.json({ ok: true, incomes: adminMJC.incomesDB }));
+
+// ─── Telegram commands for admin ───
+// Add to existing webhook handler — /reporte, /gastos, /ingreso
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Morishita Backend on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`✅ Morishita Backend on port ${PORT}`);
+  // Start admin MJC scheduler
+  adminMJC.startScheduler(broadcast);
+  // Initial WhatsApp sync
+  setTimeout(() => adminMJC.processNewMessages().then(e => {
+    if (e.length > 0) broadcast({ type: 'expenses_updated', count: e.length, expenses: e });
+    console.log(`📱 Sync inicial: ${e.length} gastos encontrados`);
+  }).catch(console.error), 3000);
+});
