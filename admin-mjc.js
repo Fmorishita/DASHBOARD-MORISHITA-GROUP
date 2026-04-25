@@ -1,285 +1,251 @@
-// ═══════════════════════════════════════════════════════
-//  AGENTE ADMIN MJC — Corte semanal + reporte diario
-//  Lee WhatsApp "Compras y gastos Morishita" via Green API
-//  Procesa con Claude Vision (tickets) + texto
-//  Reporta a Fran via Telegram
-// ═══════════════════════════════════════════════════════
+// ────── Admin MJC Agent ──────
+// Lee gastos desde WhatsApp "Compras y gastos Morishita" via Green API
+// Genera reportes semanales y los envía a Telegram
 
-const GROUP_ID = '120363404195165746@g.us';
+const https = require('https');
+
+// Green API credentials
 const GREEN_INSTANCE = process.env.GREEN_INSTANCE || '7107598670';
 const GREEN_TOKEN = process.env.GREEN_TOKEN || '38114b4ee18048ea9c472c18842d4ead3f1efe991e9a46ef8c';
-const GREEN_API = `https://7107.api.greenapi.com`;
-const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ALLOWED_CHAT_ID = process.env.ALLOWED_CHAT_ID;
+const GROUP_ID = '120363404195165746@g.us';
+const TG_BOT_TOKEN = process.env.BOT_TOKEN;
+const TG_CHAT_ID = process.env.ALLOWED_CHAT_ID || '1475348027';
 
-// In-memory store (replace with Supabase later)
-let expensesDB = [];
-let incomesDB = [];
-let lastProcessedTs = Date.now() - (7 * 24 * 60 * 60 * 1000); // last 7 days on first run
+// In-memory databases
+const expensesDB = [];
+const incomesDB = [];
+const lastProcessedTimestamp = {};
 
-// ─── Green API helpers ───
-async function waGetHistory(count = 100) {
-  const res = await fetch(`${GREEN_API}/waInstance${GREEN_INSTANCE}/getChatHistory/${GREEN_TOKEN}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chatId: GROUP_ID, count })
-  });
-  return res.json();
-}
-
-async function waGetMedia(msgId) {
-  try {
-    const res = await fetch(`${GREEN_API}/waInstance${GREEN_INSTANCE}/downloadFile/${GREEN_TOKEN}`, {
+// ────── Green API ──────
+function greenAPI(method, body = {}) {
+  return new Promise((resolve, reject) => {
+    const path = `/waInstance${GREEN_INSTANCE}/${method}/${GREEN_TOKEN}`;
+    const options = {
+      hostname: '7107.api.greenapi.com',
+      path: path,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chatId: GROUP_ID, idMessage: msgId })
+      headers: { 'Content-Type': 'application/json' }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          resolve([]);
+        }
+      });
     });
-    const data = await res.json();
-    return data.downloadUrl || null;
-  } catch(e) { return null; }
-}
-
-// ─── Claude helpers ───
-async function callClaude(system, user, model = 'claude-haiku-4-5', maxTokens = 1024) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] })
+    
+    req.on('error', reject);
+    req.write(JSON.stringify(body));
+    req.end();
   });
-  const d = await res.json();
-  if (!d.content) throw new Error(d.error?.message || 'Claude error');
-  return d.content[0].text;
 }
 
-async function analyzeTicketImage(imageUrl) {
-  try {
-    // Fetch image as base64
-    const imgRes = await fetch(imageUrl);
-    const buf = await imgRes.arrayBuffer();
-    const b64 = Buffer.from(buf).toString('base64');
-    const contentType = imgRes.headers.get('content-type') || 'image/jpeg';
+// ────── Parse amounts from text ──────
+function parseAmounts(text) {
+  const matches = text.match(/\$?\s*(\d+(?:[,\.]\d+)?)/g);
+  const amounts = [];
+  if (matches) {
+    matches.forEach(m => {
+      const num = parseFloat(m.replace(/[$,\s]/g, ''));
+      if (num > 100 && num < 100000) {
+        amounts.push(num);
+      }
+    });
+  }
+  return amounts;
+}
 
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+// ────── Week calculation ──────
+function getWeekRange(timestamp) {
+  const date = new Date(timestamp * 1000);
+  const day = date.getDay();
+  const diff = date.getDate() - day + (day === 0 ? -6 : 1);
+  const monday = new Date(date.setDate(diff));
+  const sunday = new Date(monday);
+  sunday.setDate(sunday.getDate() + 6);
+  return {
+    start: monday,
+    end: sunday,
+    key: monday.toLocaleDateString('es-MX')
+  };
+}
+
+// ────── Telegram notification ──────
+async function tgSend(message) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      chat_id: TG_CHAT_ID,
+      text: message,
+      parse_mode: 'HTML'
+    });
+
+    const options = {
+      hostname: 'api.telegram.org',
+      path: `/bot${TG_BOT_TOKEN}/sendMessage`,
       method: 'POST',
       headers: {
-        'x-api-key': ANTHROPIC_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5',
-        max_tokens: 256,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: contentType, data: b64 } },
-            { type: 'text', text: 'Extrae del ticket/recibo: descripción del producto/servicio y monto total en pesos mexicanos. Responde SOLO en JSON: {"descripcion":"...","monto":0,"moneda":"MXN"}. Si no es un ticket, responde {"descripcion":null,"monto":null}' }
-          ]
-        }]
-      })
-    });
-    const d = await res.json();
-    const text = d.content?.[0]?.text || '{}';
-    const match = text.match(/\{[\s\S]*\}/);
-    return match ? JSON.parse(match[0]) : { descripcion: null, monto: null };
-  } catch(e) {
-    console.error('Image analysis error:', e.message);
-    return { descripcion: null, monto: null };
-  }
-}
-
-// ─── Parse text expenses ───
-async function parseTextExpense(text) {
-  try {
-    const result = await callClaude(
-      'Eres un parser de gastos para un restaurante japonés premium en México. Extrae gastos de mensajes informales.',
-      `Extrae el gasto de este mensaje: "${text}"\n\nResponde SOLO en JSON: {"descripcion":"...","monto":0,"moneda":"MXN","categoria":"ingredientes|suministros|servicios|personal|otros"}\nSi no hay gasto claro, responde {"descripcion":null,"monto":null}`,
-      'claude-haiku-4-5', 256
-    );
-    const match = result.match(/\{[\s\S]*\}/);
-    return match ? JSON.parse(match[0]) : { descripcion: null, monto: null };
-  } catch(e) { return { descripcion: null, monto: null }; }
-}
-
-// ─── Process WhatsApp messages ───
-async function processNewMessages() {
-  console.log('📱 Leyendo mensajes de WhatsApp...');
-  const msgs = await waGetHistory(100);
-  if (!Array.isArray(msgs)) { console.error('WA error:', msgs); return []; }
-
-  const newExpenses = [];
-  const newMsgs = msgs.filter(m => (m.timestamp * 1000) > lastProcessedTs);
-
-  console.log(`  Nuevos mensajes: ${newMsgs.length}`);
-
-  for (const msg of newMsgs) {
-    const ts = new Date(msg.timestamp * 1000).toISOString();
-    const sender = msg.senderName || msg.sender || '?';
-
-    // Text message
-    if (msg.textMessage && msg.textMessage.trim()) {
-      const text = msg.textMessage.trim();
-      // Skip non-expense messages
-      if (/reserva|mándame|chansita|aguanta|faltan|falta|transfirieron|utilidades/i.test(text)) continue;
-
-      const parsed = await parseTextExpense(text);
-      if (parsed.monto && parsed.monto > 0) {
-        const expense = { id: msg.idMessage, ts, sender, descripcion: parsed.descripcion, monto: parsed.monto, categoria: parsed.categoria || 'otros', fuente: 'texto', raw: text };
-        newExpenses.push(expense);
-        console.log(`  ✅ Gasto texto: ${parsed.descripcion} $${parsed.monto}`);
+        'Content-Type': 'application/json',
+        'Content-Length': body.length
       }
-    }
+    };
 
-    // Image/media message (ticket)
-    if (msg.type === 'image' || msg.typeMessage === 'imageMessage') {
-      const mediaUrl = await waGetMedia(msg.idMessage);
-      if (mediaUrl) {
-        const parsed = await analyzeTicketImage(mediaUrl);
-        if (parsed.monto && parsed.monto > 0) {
-          const expense = { id: msg.idMessage, ts, sender, descripcion: parsed.descripcion, monto: parsed.monto, categoria: 'ingredientes', fuente: 'ticket', mediaUrl };
-          newExpenses.push(expense);
-          console.log(`  ✅ Gasto ticket: ${parsed.descripcion} $${parsed.monto}`);
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const result = JSON.parse(data);
+          resolve(result.ok ? { ok: true } : { ok: false, error: result.description });
+        } catch {
+          resolve({ ok: true });
         }
-      }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ────── Process WhatsApp messages ──────
+async function processNewMessages() {
+  const newExpenses = [];
+  try {
+    console.log('📱 Leyendo grupo WhatsApp...');
+    const history = await greenAPI('GetChatHistory', {
+      chatId: GROUP_ID,
+      count: 200
+    });
+
+    if (!Array.isArray(history)) {
+      console.error('Error: respuesta no es array', history);
+      return newExpenses;
     }
 
-    await sleep(300); // Rate limit
-  }
+    const textMessages = history.filter(m => m.typeMessage === 'textMessage' && m.textMessage);
+    console.log(`✅ ${textMessages.length} mensajes de texto encontrados`);
 
-  if (newMsgs.length > 0) {
-    lastProcessedTs = Math.max(...newMsgs.map(m => m.timestamp * 1000));
-  }
+    textMessages.forEach(msg => {
+      const msgKey = msg.idMessage;
+      
+      if (lastProcessedTimestamp[msgKey]) return;
+      
+      const amounts = parseAmounts(msg.textMessage);
+      amounts.forEach(amount => {
+        const expense = {
+          id: `${msg.idMessage}_${amount}`,
+          date: new Date(msg.timestamp * 1000).toLocaleDateString('es-MX'),
+          description: msg.textMessage.substring(0, 100),
+          amount: amount,
+          category: msg.textMessage.includes('atún') ? 'Atún' : 
+                    msg.textMessage.includes('Wagyu') ? 'Wagyu' : 
+                    msg.textMessage.includes('gas') ? 'Servicios' : 'Ingredientes',
+          source: 'whatsapp',
+          timestamp: msg.timestamp
+        };
+        
+        if (!expensesDB.find(e => e.id === expense.id)) {
+          expensesDB.push(expense);
+          newExpenses.push(expense);
+        }
+      });
+      
+      lastProcessedTimestamp[msgKey] = true;
+    });
 
-  expensesDB.push(...newExpenses);
+  } catch(e) {
+    console.error('❌ Error en processNewMessages:', e.message);
+  }
   return newExpenses;
 }
 
-// ─── Generate report ───
-async function generateReport(type = 'daily') {
-  const now = new Date();
-  const cutoff = type === 'weekly'
-    ? new Date(now - 7 * 24 * 60 * 60 * 1000)
-    : new Date(now - 24 * 60 * 60 * 1000);
+// ────── Generate weekly report ──────
+async function generateReport(type) {
+  if (type !== 'weekly') return '';
 
-  const periodExpenses = expensesDB.filter(e => new Date(e.ts) >= cutoff);
-  const totalGastos = periodExpenses.reduce((s, e) => s + (e.monto || 0), 0);
-  const totalIngresos = incomesDB.filter(i => new Date(i.ts) >= cutoff).reduce((s, i) => s + (i.monto || 0), 0);
-  const utilidad = totalIngresos - totalGastos;
-  const margen = totalIngresos > 0 ? ((utilidad / totalIngresos) * 100).toFixed(1) : 0;
+  const weeks = {};
+  let totalGeneral = 0;
 
-  // Group expenses by category
-  const byCategory = {};
-  periodExpenses.forEach(e => {
-    byCategory[e.categoria] = (byCategory[e.categoria] || 0) + e.monto;
+  expensesDB.forEach(exp => {
+    const range = getWeekRange(exp.timestamp || Math.floor(new Date().getTime() / 1000));
+    const weekKey = range.key;
+    
+    if (!weeks[weekKey]) {
+      weeks[weekKey] = {
+        start: range.start.toLocaleDateString('es-MX'),
+        end: range.end.toLocaleDateString('es-MX'),
+        items: [],
+        total: 0
+      };
+    }
+
+    weeks[weekKey].items.push(exp);
+    weeks[weekKey].total += exp.amount;
+    totalGeneral += exp.amount;
   });
 
-  const catStr = Object.entries(byCategory)
-    .sort((a,b) => b[1]-a[1])
-    .map(([cat, amt]) => `  • ${cat}: $${amt.toLocaleString('es-MX')}`)
-    .join('\n') || '  • Sin gastos registrados';
-
-  // Get Claude recommendation
-  const recommendation = await callClaude(
-    'Eres Paco IA, director financiero de Morishita Japanese Cuisine. Das recomendaciones ejecutivas breves y accionables.',
-    `Datos financieros del período:\n- Gastos: $${totalGastos.toLocaleString('es-MX')}\n- Ingresos: $${totalIngresos.toLocaleString('es-MX')}\n- Utilidad: $${utilidad.toLocaleString('es-MX')}\n- Margen: ${margen}%\n\nDa 2-3 recomendaciones concretas en máximo 100 palabras. Si hay utilidad, sugiere cómo reinvertir.`,
-    'claude-haiku-4-5', 300
-  );
-
-  const periodLabel = type === 'weekly' ? 'Semana' : 'Día';
-  const emoji = utilidad >= 0 ? '📈' : '📉';
-  const icon = type === 'weekly' ? '📊' : '🌅';
-
-  return `${icon} <b>Reporte ${periodLabel} — Morishita Japanese Cuisine</b>
-${new Date().toLocaleDateString('es-MX', { weekday:'long', year:'numeric', month:'long', day:'numeric' })}
-
-💰 <b>Ingresos:</b> $${totalIngresos.toLocaleString('es-MX')}
-🧾 <b>Gastos:</b> $${totalGastos.toLocaleString('es-MX')}
-${emoji} <b>Utilidad:</b> $${utilidad.toLocaleString('es-MX')} (${margen}%)
-
-📋 <b>Gastos por categoría:</b>
-${catStr}
-
-🤖 <b>Paco recomienda:</b>
-${recommendation}
-
-<i>Fuente: ${periodExpenses.length} gastos de WhatsApp "Compras y gastos Morishita"</i>`;
-}
-
-// ─── Telegram notify ───
-async function tgSend(text) {
-  if (!BOT_TOKEN || !ALLOWED_CHAT_ID) return;
-  await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: ALLOWED_CHAT_ID, text, parse_mode: 'HTML' })
+  const sortedWeeks = Object.values(weeks).sort((a, b) => {
+    const dateA = new Date(a.start.split('/').reverse().join('-'));
+    const dateB = new Date(b.start.split('/').reverse().join('-'));
+    return dateB - dateA;
   });
+
+  let report = `<b>📋 CORTE SEMANAL MORISHITA JAPANESE CUISINE</b>\n`;
+  
+  if (sortedWeeks.length > 0) {
+    const currentWeek = sortedWeeks[0];
+    report += `<b>Semana: ${currentWeek.start} → ${currentWeek.end}</b>\n\n`;
+    
+    report += `<b>💰 Gastos esta semana:</b>\n`;
+    currentWeek.items.forEach(item => {
+      report += `  • ${item.description.substring(0, 30)}: $${item.amount.toLocaleString()} MXN\n`;
+    });
+    report += `\n<b>Subtotal: $${currentWeek.total.toLocaleString()} MXN</b>\n\n`;
+  }
+
+  report += `<b>📈 Total histórico:</b> $${totalGeneral.toLocaleString()} MXN\n`;
+  report += `<b>📅 Semanas registradas:</b> ${sortedWeeks.length}\n\n`;
+
+  report += `<b>💡 Recomendación Paco IA:</b>\n`;
+  if (sortedWeeks[0]?.total > 5000) {
+    report += `⚠️  Gastos altos esta semana. Revisar proveedores y volúmenes.\n`;
+  } else if (sortedWeeks[0]?.total > 0) {
+    report += `✅ Gastos dentro de rango normal.\n`;
+  }
+  
+  if (incomesDB.length === 0) {
+    report += `⚠️  No hay ingresos registrados aún (requiere input manual).\n`;
+  } else {
+    const totalIncome = incomesDB.reduce((sum, inc) => sum + inc.amount, 0);
+    const utilidad = totalIncome - (sortedWeeks[0]?.total || 0);
+    report += `✅ Ingresos semana: $${totalIncome.toLocaleString()} MXN\n`;
+    report += `📊 Utilidad estimada: $${utilidad.toLocaleString()} MXN\n`;
+  }
+
+  return report;
 }
 
-// ─── Register income ───
-async function registerIncome(amount, description) {
-  const income = { id: Date.now().toString(), ts: new Date().toISOString(), monto: amount, descripcion: description };
+// ────── Register income ──────
+function registerIncome(amount, description = '') {
+  const income = {
+    id: `inc_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    date: new Date().toLocaleDateString('es-MX'),
+    amount: parseFloat(amount),
+    description: description || 'Ingreso manual',
+    source: 'manual'
+  };
   incomesDB.push(income);
+  console.log(`✅ Ingreso registrado: $${amount} — ${description}`);
   return income;
 }
 
-// ─── Scheduled jobs ───
-// Lógica:
-// - Leer WhatsApp SOLO lunes y martes a las 10AM (UTC-6 = 16:00 UTC)
-//   para capturar gastos del fin de semana + lunes adicionales
-// - Reporte semanal SOLO lunes a las 9AM (antes de la lectura)
-//   así el martes puede complementar si faltaron gastos
-// - Sin reportes diarios
-function startScheduler(broadcast) {
-
-  // Check every day at 10AM Mexico (16:00 UTC) — but only execute on Mon/Tue
-  scheduleDailyAt(16, 0, async () => {
-    const dayUTC = new Date().getUTCDay(); // 0=Sun,1=Mon,2=Tue
-    const isMon = dayUTC === 1;
-    const isTue = dayUTC === 2;
-
-    if (!isMon && !isTue) {
-      console.log('⏭ Hoy no es lunes/martes — omitiendo lectura de WhatsApp');
-      return;
-    }
-
-    console.log(`📱 ${isMon ? 'Lunes' : 'Martes'} — Leyendo gastos del fin de semana...`);
-    try {
-      const newExpenses = await processNewMessages();
-      if (newExpenses.length > 0) {
-        broadcast({ type: 'expenses_updated', count: newExpenses.length, expenses: newExpenses });
-        console.log(`💰 ${newExpenses.length} gastos procesados`);
-      } else {
-        console.log('💰 Sin gastos nuevos en WhatsApp');
-      }
-    } catch(e) { console.error('WA sync error:', e.message); }
-  });
-
-  // Weekly report: Monday 9AM Mexico (15:00 UTC)
-  // Runs BEFORE the 10AM WhatsApp read — captures Wed-Sun gastos
-  // Tuesday's read will add any Monday/late additions (visible next week)
-  scheduleWeeklyMonday(15, 0, async () => {
-    console.log('📊 Generando reporte semanal (lunes 9AM)...');
-    try {
-      // First do a quick sync to catch anything posted Mon morning
-      await processNewMessages();
-      const report = await generateReport('weekly');
-      await tgSend(report);
-      console.log('✅ Reporte semanal enviado a Fran');
-    } catch(e) { console.error('Weekly report error:', e.message); }
-  });
-
-  const nextMon = msUntilNextWeekday(1, 15, 0);
-  const nextTue = msUntilNextWeekday(2, 16, 0);
-  console.log(`⏰ Scheduler MJC iniciado:`);
-  console.log(`   📊 Próximo reporte semanal: lunes en ${Math.round(nextMon/3600000)}h`);
-  console.log(`   📱 Próxima lectura WA: ${nextTue < nextMon ? 'martes' : 'lunes'} en ${Math.round(Math.min(nextMon,nextTue)/3600000)}h`);
-}
-
+// ────── Schedulers ──────
 function scheduleDailyAt(hourUTC, minUTC, fn) {
   const now = new Date();
   const next = new Date();
@@ -301,7 +267,7 @@ function msUntilNextWeekday(weekday, hourUTC, minUTC) {
   if (daysUntil === 0) {
     const todayTarget = new Date();
     todayTarget.setUTCHours(hourUTC, minUTC, 0, 0);
-    if (todayTarget <= now) daysUntil = 7; // already passed today, next week
+    if (todayTarget <= now) daysUntil = 7;
   }
   const next = new Date(now);
   next.setUTCDate(now.getUTCDate() + daysUntil);
@@ -309,6 +275,51 @@ function msUntilNextWeekday(weekday, hourUTC, minUTC) {
   return next - now;
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// ────── Start scheduler ──────
+function startScheduler(broadcastWS = null) {
+  scheduleDailyAt(16, 0, async () => {
+    const dayUTC = new Date().getUTCDay();
+    const isMon = dayUTC === 1;
+    const isTue = dayUTC === 2;
 
-module.exports = { startScheduler, processNewMessages, generateReport, registerIncome, expensesDB, incomesDB };
+    if (!isMon && !isTue) {
+      console.log('✋ No es lunes/martes — omitiendo lectura');
+      return;
+    }
+
+    console.log(`📱 ${isMon ? 'Lunes' : 'Martes'} 10AM — Leyendo gastos...`);
+    try {
+      const newExpenses = await processNewMessages();
+      if (newExpenses.length > 0) {
+        if (broadcastWS) broadcastWS({ type: 'expenses_updated', count: newExpenses.length, expenses: newExpenses });
+        console.log(`💰 ${newExpenses.length} gastos nuevos`);
+      }
+    } catch(e) { console.error('WA sync error:', e.message); }
+  });
+
+  scheduleWeeklyMonday(15, 0, async () => {
+    console.log('📋 Lunes 9AM — Generando reporte semanal...');
+    try {
+      await processNewMessages();
+      const report = await generateReport('weekly');
+      if (report) await tgSend(report);
+      console.log('✅ Reporte enviado a Fran');
+    } catch(e) { console.error('Report error:', e.message); }
+  });
+
+  const nextMon = msUntilNextWeekday(1, 15, 0);
+  const nextTue = msUntilNextWeekday(2, 16, 0);
+  console.log(`⏰ Admin MJC scheduler iniciado`);
+  console.log(`   📋 Próximo reporte: en ${Math.round(nextMon/3600000)}h`);
+  console.log(`   📱 Próxima lectura: en ${Math.round(Math.min(nextMon,nextTue)/3600000)}h`);
+}
+
+module.exports = {
+  startScheduler,
+  processNewMessages,
+  generateReport,
+  registerIncome,
+  expensesDB,
+  incomesDB,
+  tgSend
+};
